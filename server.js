@@ -3,6 +3,7 @@ import multer from "multer";
 import { execFile } from "child_process";
 import fs from "fs";
 import path from "path";
+import { PNG } from "pngjs";
 
 const app = express();
 
@@ -13,87 +14,156 @@ const upload = multer({ dest: "/tmp" });
 
 app.get("/", (req, res) => res.send("ffmpeg-crop-service OK"));
 
-/**
- * ✅ Auto-detect crop rectangle using ffmpeg cropdetect
- * POST /detect  (multipart/form-data)
- * field: file  (video)
- * optional: sample_time (seconds, default 0.5)
- */
-app.post("/detect", upload.any(), async (req, res) => {
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, (err, stdout, stderr) => {
+      if (err) reject({ err, stdout, stderr });
+      else resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function ffprobeDims(inputPath) {
+  const { stdout } = await run("ffprobe", [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=width,height",
+    "-of",
+    "json",
+    inputPath,
+  ]);
+  const parsed = JSON.parse(stdout);
+  const s = parsed?.streams?.[0];
+  return { w: Number(s?.width), h: Number(s?.height) };
+}
+
+// Simple “header/footer” detection by scanning dark rows.
+// Works well for: black UI bars, black title headers, repost overlays at top/bottom.
+function detectCutsFromPng(png, opts = {}) {
+  const { width, height, data } = png;
+
+  const darkThreshold = Number(opts.darkThreshold ?? 35); // 0..255
+  const minBandRatio = Number(opts.minBandRatio ?? 0.03); // 3% height
+  const maxBandRatio = Number(opts.maxBandRatio ?? 0.35); // 35% height
+
+  const minBand = Math.floor(height * minBandRatio);
+  const maxBand = Math.floor(height * maxBandRatio);
+
+  const rowMean = new Array(height).fill(0);
+
+  // mean luminance per row
+  for (let y = 0; y < height; y++) {
+    let sum = 0;
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      // luminance
+      sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+    rowMean[y] = sum / width;
+  }
+
+  // Top cut: find longest prefix of “dark rows”
+  let topCut = 0;
+  while (topCut < maxBand && rowMean[topCut] < darkThreshold) topCut++;
+
+  // Bottom cut: find longest suffix of “dark rows”
+  let bottomCut = 0;
+  while (bottomCut < maxBand && rowMean[height - 1 - bottomCut] < darkThreshold) bottomCut++;
+
+  // Only accept cut if it’s at least minBand; otherwise treat as 0
+  if (topCut < minBand) topCut = 0;
+  if (bottomCut < minBand) bottomCut = 0;
+
+  return { topCut, bottomCut, width, height };
+}
+
+// ---------------------------
+// ✅ NEW: /detect
+// ---------------------------
+app.post("/detect", upload.single("file"), async (req, res) => {
   try {
-    // Be tolerant: accept any field name and take first file
-    const file = req.files?.[0];
-    if (!file) {
-      return res.status(400).json({ error: "No file uploaded. Send multipart/form-data with a file." });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded. Use field name 'file'." });
     }
 
-    const inputPath = file.path;
+    const inputPath = req.file.path;
+    const sampleTime = req.body.sample_time ? Number(req.body.sample_time) : 0.5;
 
-    const sample_time = req.body.sample_time ? Number(req.body.sample_time) : 0.5;
-    if (!Number.isFinite(sample_time) || sample_time < 0) {
-      return res.status(400).json({ error: "Invalid sample_time. Must be a number >= 0." });
+    const { w: src_w, h: src_h } = await ffprobeDims(inputPath);
+    if (!Number.isFinite(src_w) || !Number.isFinite(src_h)) {
+      return res.status(400).json({ error: "Could not read video dimensions." });
     }
 
-    // Run cropdetect on a short slice
-    // -ss seeks, -t processes ~1s, cropdetect prints "crop=w:h:x:y" in stderr
-    const args = [
-      "-hide_banner",
+    const framePath = path.join("/tmp", `frame-${Date.now()}.png`);
+
+    // Extract one frame
+    await run("ffmpeg", [
+      "-y",
       "-ss",
-      String(sample_time),
+      String(sampleTime),
       "-i",
       inputPath,
-      "-t",
+      "-vframes",
       "1",
       "-vf",
-      "cropdetect=24:16:0", // (limit:24, round:16, reset:0)
-      "-f",
-      "null",
-      "-"
-    ];
+      "scale=iw:ih",
+      framePath,
+    ]);
 
-    execFile("ffmpeg", args, (err, stdout, stderr) => {
-      // Always cleanup input
-      fs.unlink(inputPath, () => {});
+    const buf = fs.readFileSync(framePath);
+    const png = PNG.sync.read(buf);
 
-      if (err) {
-        return res.status(500).json({
-          error: "ffmpeg detect failed",
-          details: stderr?.slice?.(0, 4000) || String(err),
-        });
-      }
+    const { topCut, bottomCut } = detectCutsFromPng(png, {
+      darkThreshold: req.body.dark_threshold ? Number(req.body.dark_threshold) : 35,
+      minBandRatio: req.body.min_band_ratio ? Number(req.body.min_band_ratio) : 0.03,
+      maxBandRatio: req.body.max_band_ratio ? Number(req.body.max_band_ratio) : 0.35,
+    });
 
-      // Parse LAST crop= line
-      const lines = (stderr || "").split("\n");
-      const cropLines = lines.filter((l) => l.includes("crop="));
-      const last = cropLines[cropLines.length - 1] || "";
-      const match = last.match(/crop=(\d+):(\d+):(\d+):(\d+)/);
+    // Usable area after removing header/footer
+    const usableY0 = topCut;
+    const usableY1 = src_h - bottomCut;
+    const usableH = Math.max(1, usableY1 - usableY0);
 
-      if (!match) {
-        return res.status(422).json({
-          error: "Could not detect crop",
-          details: last.slice(0, 500),
-        });
-      }
+    // Build a square crop inside usable region
+    const safeMargin = req.body.safe_margin ? Number(req.body.safe_margin) : 0; // pixels
+    const cropSize = Math.min(src_w, usableH) - safeMargin * 2;
+    const crop_w = Math.max(2, Math.floor(cropSize));
+    const crop_h = crop_w;
 
-      const crop_w = Number(match[1]);
-      const crop_h = Number(match[2]);
-      const x = Number(match[3]);
-      const y = Number(match[4]);
+    // Center it
+    const x = Math.max(0, Math.floor((src_w - crop_w) / 2));
+    const y = Math.max(0, Math.floor(usableY0 + (usableH - crop_h) / 2));
 
-      return res.json({
-        crop_w,
-        crop_h,
-        x,
-        y,
-        sample_time,
-        method: "ffmpeg_cropdetect",
-      });
+    // cleanup
+    fs.unlink(framePath, () => {});
+    fs.unlink(inputPath, () => {});
+
+    return res.json({
+      crop_w,
+      crop_h,
+      x,
+      y,
+      src_w,
+      src_h,
+      top_cut: topCut,
+      bottom_cut: bottomCut,
+      sample_time: sampleTime,
+      safe_margin: safeMargin,
     });
   } catch (e) {
-    res.status(500).json({ error: "Server error", details: String(e) });
+    return res.status(500).json({ error: "detect failed", details: String(e?.stderr || e) });
   }
 });
 
+// ---------------------------
+// ✅ EXISTING: /crop
+// ---------------------------
 app.post("/crop", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
