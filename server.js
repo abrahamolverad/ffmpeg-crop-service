@@ -84,7 +84,7 @@ function detectCutsFromPng(png, opts = {}) {
 }
 
 // ---------------------------
-// ✅ NEW: AI-Powered Detection (Multi-Frame)
+// ✅ AI-Powered Detection (Multi-Frame)
 // ---------------------------
 app.post("/detect-ai", upload.single("file"), async (req, res) => {
   try {
@@ -93,7 +93,7 @@ app.post("/detect-ai", upload.single("file"), async (req, res) => {
     }
 
     const inputPath = req.file.path;
-    
+
     // Get video dimensions
     const { w: src_w, h: src_h } = await ffprobeDims(inputPath);
     if (!Number.isFinite(src_w) || !Number.isFinite(src_h)) {
@@ -113,7 +113,7 @@ app.post("/detect-ai", upload.single("file"), async (req, res) => {
     const durationData = JSON.parse(durationOutput);
     const duration = Number(durationData?.format?.duration) || 10;
 
-    // Sample 3 frames at different points (beginning, middle, end)
+    // Sample N frames at different points (spread across video)
     const numFrames = req.body.num_frames ? Number(req.body.num_frames) : 3;
     const timestamps = [];
     for (let i = 0; i < numFrames; i++) {
@@ -126,7 +126,7 @@ app.post("/detect-ai", upload.single("file"), async (req, res) => {
     const frames = [];
     for (let i = 0; i < timestamps.length; i++) {
       const framePath = path.join("/tmp", `frame-${Date.now()}-${i}.png`);
-      
+
       try {
         await run("ffmpeg", [
           "-y",
@@ -170,7 +170,9 @@ app.post("/detect-ai", upload.single("file"), async (req, res) => {
       })),
       {
         type: "text",
-        text: `You are analyzing ${frames.length} frames from a vertical social media video (${src_w}x${src_h} pixels) extracted at timestamps: ${timestamps.map(t => t.toFixed(1) + "s").join(", ")}.
+        text: `You are analyzing ${frames.length} frames from a vertical social media video (${src_w}x${src_h} pixels) extracted at timestamps: ${timestamps
+          .map((t) => t.toFixed(1) + "s")
+          .join(", ")}.
 
 Your task is to determine the optimal crop rectangle that:
 1. EXCLUDES all UI elements: text overlays, usernames, captions, watermarks, logos, headers, footers
@@ -198,9 +200,9 @@ All values must be integers. The crop must fit within ${src_w}x${src_h}.`,
       },
     ];
 
-    // Call OpenAI GPT-4 Vision
+    // Call OpenAI Vision model (GPT-5-mini)
     const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-5-mini",
       messages: [
         {
           role: "user",
@@ -253,7 +255,7 @@ All values must be integers. The crop must fit within ${src_w}x${src_h}.`,
       frames_analyzed: frames.length,
       timestamps_sampled: timestamps,
       ai_powered: true,
-      model_used: "gpt-4o",
+      model_used: "gpt-5-mini",
     });
   } catch (e) {
     console.error("AI detection error:", e);
@@ -307,7 +309,7 @@ app.post("/detect", upload.single("file"), async (req, res) => {
     });
 
     const safeMargin = req.body.safe_margin ? Number(req.body.safe_margin) : 10;
-    
+
     // Keep full width, only trim top/bottom
     const crop_w = src_w;
     const crop_h = Math.max(10, src_h - topCut - bottomCut - safeMargin * 2);
