@@ -13,171 +13,111 @@ const upload = multer({ dest: "/tmp" });
 
 app.get("/", (req, res) => res.send("ffmpeg-crop-service OK"));
 
-function run(cmd, args) {
-  return new Promise((resolve, reject) => {
-    execFile(cmd, args, (err, stdout, stderr) => {
-      if (err) return reject({ err, stdout, stderr });
-      resolve({ stdout, stderr });
-    });
-  });
-}
-
-async function probeVideo(filePath) {
-  const { stdout } = await run("ffprobe", [
-    "-v",
-    "error",
-    "-select_streams",
-    "v:0",
-    "-show_entries",
-    "stream=width,height",
-    "-of",
-    "json",
-    filePath,
-  ]);
-  const parsed = JSON.parse(stdout);
-  const stream = parsed.streams?.[0];
-  if (!stream?.width || !stream?.height) throw new Error("ffprobe failed to read width/height");
-  return { width: Number(stream.width), height: Number(stream.height) };
-}
-
-function parseCropdetect(stderrText) {
-  // cropdetect prints lines containing: crop=w:h:x:y
-  const matches = [...stderrText.matchAll(/crop=(\d+):(\d+):(\d+):(\d+)/g)];
-  if (!matches.length) return null;
-  const last = matches[matches.length - 1];
-  return {
-    crop_w: Number(last[1]),
-    crop_h: Number(last[2]),
-    x: Number(last[3]),
-    y: Number(last[4]),
-  };
-}
-
 /**
- * POST /detect
- * multipart/form-data: file=<video>, optional sample_time, frames, limit
- * Returns JSON crop params
+ * ✅ Auto-detect crop rectangle using ffmpeg cropdetect
+ * POST /detect  (multipart/form-data)
+ * field: file  (video)
+ * optional: sample_time (seconds, default 0.5)
  */
-app.post("/detect", upload.single("file"), async (req, res) => {
+app.post("/detect", upload.any(), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded. Use field name 'file'." });
+    // Be tolerant: accept any field name and take first file
+    const file = req.files?.[0];
+    if (!file) {
+      return res.status(400).json({ error: "No file uploaded. Send multipart/form-data with a file." });
     }
 
-    const inputPath = req.file.path;
+    const inputPath = file.path;
 
-    const sample_time = req.body.sample_time ? Number(req.body.sample_time) : 0.5; // seconds
-    const frames = req.body.frames ? Number(req.body.frames) : 30; // analyze N frames
-    const limit = req.body.limit ? Number(req.body.limit) : 24; // cropdetect sensitivity-ish
-
-    if (![sample_time, frames, limit].every(Number.isFinite)) {
-      return res.status(400).json({ error: "Invalid detect params", received: req.body });
+    const sample_time = req.body.sample_time ? Number(req.body.sample_time) : 0.5;
+    if (!Number.isFinite(sample_time) || sample_time < 0) {
+      return res.status(400).json({ error: "Invalid sample_time. Must be a number >= 0." });
     }
 
-    // Run cropdetect on a small window of frames
-    // -ss seeks first, -frames:v analyzes only a handful of frames
+    // Run cropdetect on a short slice
+    // -ss seeks, -t processes ~1s, cropdetect prints "crop=w:h:x:y" in stderr
     const args = [
       "-hide_banner",
       "-ss",
       String(sample_time),
       "-i",
       inputPath,
+      "-t",
+      "1",
       "-vf",
-      `cropdetect=limit=${limit}:round=2:reset=0`,
-      "-frames:v",
-      String(frames),
+      "cropdetect=24:16:0", // (limit:24, round:16, reset:0)
       "-f",
       "null",
-      "-",
+      "-"
     ];
 
-    let stderr;
-    try {
-      const out = await run("ffmpeg", args);
-      stderr = out.stderr || "";
-    } catch (e) {
-      stderr = e.stderr || "";
-      // even if ffmpeg returns non-zero sometimes, we still try parsing stderr
-    }
+    execFile("ffmpeg", args, (err, stdout, stderr) => {
+      // Always cleanup input
+      fs.unlink(inputPath, () => {});
 
-    const crop = parseCropdetect(stderr);
-    if (!crop) {
-      return res.status(422).json({
-        error: "Could not detect crop",
-        details: (stderr || "").slice(0, 3000),
+      if (err) {
+        return res.status(500).json({
+          error: "ffmpeg detect failed",
+          details: stderr?.slice?.(0, 4000) || String(err),
+        });
+      }
+
+      // Parse LAST crop= line
+      const lines = (stderr || "").split("\n");
+      const cropLines = lines.filter((l) => l.includes("crop="));
+      const last = cropLines[cropLines.length - 1] || "";
+      const match = last.match(/crop=(\d+):(\d+):(\d+):(\d+)/);
+
+      if (!match) {
+        return res.status(422).json({
+          error: "Could not detect crop",
+          details: last.slice(0, 500),
+        });
+      }
+
+      const crop_w = Number(match[1]);
+      const crop_h = Number(match[2]);
+      const x = Number(match[3]);
+      const y = Number(match[4]);
+
+      return res.json({
+        crop_w,
+        crop_h,
+        x,
+        y,
+        sample_time,
+        method: "ffmpeg_cropdetect",
       });
-    }
-
-    // Safety clamp to video bounds
-    const { width, height } = await probeVideo(inputPath);
-    if (crop.crop_w > width) crop.crop_w = width;
-    if (crop.crop_h > height) crop.crop_h = height;
-    if (crop.x < 0) crop.x = 0;
-    if (crop.y < 0) crop.y = 0;
-
-    // cleanup input
-    fs.unlink(inputPath, () => {});
-
-    return res.json({ ...crop, source_w: width, source_h: height });
+    });
   } catch (e) {
-    return res.status(500).json({ error: "detect failed", details: String(e?.err || e) });
+    res.status(500).json({ error: "Server error", details: String(e) });
   }
 });
 
-/**
- * POST /autocrop
- * multipart/form-data: file=<video>, optional detect params + optional trim params
- * Detects crop then returns cropped mp4
- */
-app.post("/autocrop", upload.single("file"), async (req, res) => {
+app.post("/crop", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded. Use field name 'file'." });
     }
 
-    const inputPath = req.file.path;
-    const outputPath = path.join("/tmp", `autocropped-${Date.now()}.mp4`);
+    const crop_w = Number(req.body.crop_w);
+    const crop_h = Number(req.body.crop_h);
+    const x = Number(req.body.x);
+    const y = Number(req.body.y);
 
-    const sample_time = req.body.sample_time ? Number(req.body.sample_time) : 0.5;
-    const frames = req.body.frames ? Number(req.body.frames) : 30;
-    const limit = req.body.limit ? Number(req.body.limit) : 24;
-
-    // Optional trim
     const start = req.body.start ? Number(req.body.start) : null;
     const duration = req.body.duration ? Number(req.body.duration) : null;
 
-    // 1) detect crop
-    let stderrDetect = "";
-    try {
-      const out = await run("ffmpeg", [
-        "-hide_banner",
-        "-ss",
-        String(sample_time),
-        "-i",
-        inputPath,
-        "-vf",
-        `cropdetect=limit=${limit}:round=2:reset=0`,
-        "-frames:v",
-        String(frames),
-        "-f",
-        "null",
-        "-",
-      ]);
-      stderrDetect = out.stderr || "";
-    } catch (e) {
-      stderrDetect = e.stderr || "";
-    }
-
-    const crop = parseCropdetect(stderrDetect);
-    if (!crop) {
-      fs.unlink(inputPath, () => {});
-      return res.status(422).json({
-        error: "Could not detect crop",
-        details: (stderrDetect || "").slice(0, 3000),
+    if (![crop_w, crop_h, x, y].every((n) => Number.isFinite(n))) {
+      return res.status(400).json({
+        error: "Missing/invalid crop params. Required: crop_w,crop_h,x,y (numbers).",
+        received: req.body,
       });
     }
 
-    // 2) apply crop
+    const inputPath = req.file.path;
+    const outputPath = path.join("/tmp", `cropped-${Date.now()}.mp4`);
+
     const args = [];
     if (start !== null) args.push("-ss", String(start));
     args.push("-i", inputPath);
@@ -185,7 +125,7 @@ app.post("/autocrop", upload.single("file"), async (req, res) => {
 
     args.push(
       "-vf",
-      `crop=${crop.crop_w}:${crop.crop_h}:${crop.x}:${crop.y}`,
+      `crop=${crop_w}:${crop_h}:${x}:${y}`,
       "-c:v",
       "libx264",
       "-preset",
@@ -199,29 +139,28 @@ app.post("/autocrop", upload.single("file"), async (req, res) => {
       outputPath
     );
 
-    try {
-      await run("ffmpeg", args);
-    } catch (e) {
-      return res.status(500).json({
-        error: "ffmpeg failed",
-        details: (e.stderr || String(e.err || e)).slice(0, 4000),
+    execFile("ffmpeg", args, (err, stdout, stderr) => {
+      if (err) {
+        return res.status(500).json({
+          error: "ffmpeg failed",
+          details: stderr?.slice?.(0, 4000) || String(err),
+        });
+      }
+
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", 'attachment; filename="cropped.mp4"');
+
+      const stream = fs.createReadStream(outputPath);
+      stream.on("close", () => {
+        fs.unlink(inputPath, () => {});
+        fs.unlink(outputPath, () => {});
       });
-    }
-
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", 'attachment; filename="autocropped.mp4"');
-
-    const stream = fs.createReadStream(outputPath);
-    stream.on("close", () => {
-      fs.unlink(inputPath, () => {});
-      fs.unlink(outputPath, () => {});
+      stream.pipe(res);
     });
-    stream.pipe(res);
   } catch (e) {
     res.status(500).json({ error: "Server error", details: String(e) });
   }
 });
 
-// Render PORT
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`FFmpeg service listening on port ${PORT}`));
