@@ -84,7 +84,7 @@ function detectCutsFromPng(png, opts = {}) {
 }
 
 // ---------------------------
-// ✅ AI-Powered Detection (Multi-Frame)
+// ✅ NEW: AI-Powered Detection (Multi-Frame)
 // ---------------------------
 app.post("/detect-ai", upload.single("file"), async (req, res) => {
   try {
@@ -93,7 +93,7 @@ app.post("/detect-ai", upload.single("file"), async (req, res) => {
     }
 
     const inputPath = req.file.path;
-
+    
     // Get video dimensions
     const { w: src_w, h: src_h } = await ffprobeDims(inputPath);
     if (!Number.isFinite(src_w) || !Number.isFinite(src_h)) {
@@ -113,12 +113,9 @@ app.post("/detect-ai", upload.single("file"), async (req, res) => {
     const durationData = JSON.parse(durationOutput);
     const duration = Number(durationData?.format?.duration) || 10;
 
-    // Sample N frames at different points (spread across video)
-    const numFrames = req.body.num_frames ? Number(req.body.num_frames) : 3;
-    const timestamps = [];
-    for (let i = 0; i < numFrames; i++) {
-      timestamps.push(Math.min(duration * 0.9, (duration / (numFrames + 1)) * (i + 1)));
-    }
+    // Sample ONLY 1 frame from middle for faster, more consistent results
+    const numFrames = 1;
+    const timestamps = [duration * 0.4]; // Sample at 40% through the video
 
     console.log(`Extracting ${numFrames} frames at timestamps:`, timestamps);
 
@@ -126,7 +123,7 @@ app.post("/detect-ai", upload.single("file"), async (req, res) => {
     const frames = [];
     for (let i = 0; i < timestamps.length; i++) {
       const framePath = path.join("/tmp", `frame-${Date.now()}-${i}.png`);
-
+      
       try {
         await run("ffmpeg", [
           "-y",
@@ -170,9 +167,7 @@ app.post("/detect-ai", upload.single("file"), async (req, res) => {
       })),
       {
         type: "text",
-        text: `You are analyzing ${frames.length} frames from a vertical social media video (${src_w}x${src_h} pixels) extracted at timestamps: ${timestamps
-          .map((t) => t.toFixed(1) + "s")
-          .join(", ")}.
+        text: `You are analyzing ${frames.length} frames from a vertical social media video (${src_w}x${src_h} pixels) extracted at timestamps: ${timestamps.map(t => t.toFixed(1) + "s").join(", ")}.
 
 Your task is to determine the optimal crop rectangle that:
 1. EXCLUDES all UI elements: text overlays, usernames, captions, watermarks, logos, headers, footers
@@ -200,9 +195,9 @@ All values must be integers. The crop must fit within ${src_w}x${src_h}.`,
       },
     ];
 
-    // Call OpenAI Vision model (GPT-5-mini)
+    // Call OpenAI GPT-4o-mini Vision (cheaper alternative)
     const response = await openai.chat.completions.create({
-      model: "gpt-5-mini",
+      model: "gpt-4o-mini",
       messages: [
         {
           role: "user",
@@ -234,11 +229,28 @@ All values must be integers. The crop must fit within ${src_w}x${src_h}.`,
       });
     }
 
-    // Validate crop values
-    const crop_x = Math.max(0, Math.min(src_w - 10, Math.floor(cropData.crop_x)));
-    const crop_y = Math.max(0, Math.min(src_h - 10, Math.floor(cropData.crop_y)));
-    const crop_w = Math.max(10, Math.min(src_w - crop_x, Math.floor(cropData.crop_w)));
-    const crop_h = Math.max(10, Math.min(src_h - crop_y, Math.floor(cropData.crop_h)));
+    // Validate and enforce minimum cropping
+    let crop_x = Math.max(0, Math.floor(cropData.crop_x));
+    let crop_y = Math.max(0, Math.floor(cropData.crop_y));
+    let crop_w = Math.floor(cropData.crop_w);
+    let crop_h = Math.floor(cropData.crop_h);
+
+    // ENFORCE: If crop is too conservative, apply minimum safe cropping
+    // Most social videos have at least 100px header and 100px footer
+    if (crop_y < 80) {
+      console.log(`Warning: crop_y too small (${crop_y}), enforcing minimum 100px top crop`);
+      crop_y = 100;
+    }
+    
+    const bottom_margin = src_h - (crop_y + crop_h);
+    if (bottom_margin < 80) {
+      console.log(`Warning: bottom margin too small (${bottom_margin}), enforcing minimum 100px bottom crop`);
+      crop_h = src_h - crop_y - 100;
+    }
+
+    // Ensure crop stays within bounds
+    crop_w = Math.max(10, Math.min(src_w - crop_x, crop_w));
+    crop_h = Math.max(10, Math.min(src_h - crop_y, crop_h));
 
     // Cleanup
     fs.unlink(inputPath, () => {});
@@ -255,7 +267,7 @@ All values must be integers. The crop must fit within ${src_w}x${src_h}.`,
       frames_analyzed: frames.length,
       timestamps_sampled: timestamps,
       ai_powered: true,
-      model_used: "gpt-5-mini",
+      model_used: "gpt-4o-mini",
     });
   } catch (e) {
     console.error("AI detection error:", e);
@@ -309,7 +321,7 @@ app.post("/detect", upload.single("file"), async (req, res) => {
     });
 
     const safeMargin = req.body.safe_margin ? Number(req.body.safe_margin) : 10;
-
+    
     // Keep full width, only trim top/bottom
     const crop_w = src_w;
     const crop_h = Math.max(10, src_h - topCut - bottomCut - safeMargin * 2);
