@@ -6,8 +6,8 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev
 
 COPY server.js ./
 
