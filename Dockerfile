@@ -1,12 +1,15 @@
-FROM node:18-bullseye
-
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+FROM node:18-alpine
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci --omit=dev
+# Install ffmpeg + ffprobe
+RUN apk add --no-cache ffmpeg
 
+# Install deps (no lockfile needed)
+COPY package.json ./
+RUN npm install --omit=dev
+
+# Copy app
 COPY server.js ./
 
 EXPOSE 3000
