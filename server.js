@@ -4,6 +4,7 @@ import { execFile } from "child_process";
 import fs from "fs";
 import path from "path";
 import { PNG } from "pngjs";
+import OpenAI from "openai";
 
 const app = express();
 
@@ -12,7 +13,12 @@ app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ dest: "/tmp" });
 
-app.get("/", (req, res) => res.send("ffmpeg-crop-service OK"));
+// Initialize OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+app.get("/", (req, res) => res.send("ffmpeg-crop-service with AI detection OK"));
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
@@ -40,21 +46,19 @@ async function ffprobeDims(inputPath) {
   return { w: Number(s?.width), h: Number(s?.height) };
 }
 
-// Simple “header/footer” detection by scanning dark rows.
-// Works well for: black UI bars, black title headers, repost overlays at top/bottom.
+// Simple "header/footer" detection by scanning dark rows.
 function detectCutsFromPng(png, opts = {}) {
   const { width, height, data } = png;
 
-  const darkThreshold = Number(opts.darkThreshold ?? 35); // 0..255
-  const minBandRatio = Number(opts.minBandRatio ?? 0.03); // 3% height
-  const maxBandRatio = Number(opts.maxBandRatio ?? 0.35); // 35% height
+  const darkThreshold = Number(opts.darkThreshold ?? 35);
+  const minBandRatio = Number(opts.minBandRatio ?? 0.03);
+  const maxBandRatio = Number(opts.maxBandRatio ?? 0.35);
 
   const minBand = Math.floor(height * minBandRatio);
   const maxBand = Math.floor(height * maxBandRatio);
 
   const rowMean = new Array(height).fill(0);
 
-  // mean luminance per row
   for (let y = 0; y < height; y++) {
     let sum = 0;
     for (let x = 0; x < width; x++) {
@@ -62,21 +66,17 @@ function detectCutsFromPng(png, opts = {}) {
       const r = data[idx];
       const g = data[idx + 1];
       const b = data[idx + 2];
-      // luminance
       sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
     }
     rowMean[y] = sum / width;
   }
 
-  // Top cut: find longest prefix of “dark rows”
   let topCut = 0;
   while (topCut < maxBand && rowMean[topCut] < darkThreshold) topCut++;
 
-  // Bottom cut: find longest suffix of “dark rows”
   let bottomCut = 0;
   while (bottomCut < maxBand && rowMean[height - 1 - bottomCut] < darkThreshold) bottomCut++;
 
-  // Only accept cut if it’s at least minBand; otherwise treat as 0
   if (topCut < minBand) topCut = 0;
   if (bottomCut < minBand) bottomCut = 0;
 
@@ -84,7 +84,189 @@ function detectCutsFromPng(png, opts = {}) {
 }
 
 // ---------------------------
-// ✅ NEW: /detect
+// ✅ NEW: AI-Powered Detection (Multi-Frame)
+// ---------------------------
+app.post("/detect-ai", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded. Use field name 'file'." });
+    }
+
+    const inputPath = req.file.path;
+    
+    // Get video dimensions
+    const { w: src_w, h: src_h } = await ffprobeDims(inputPath);
+    if (!Number.isFinite(src_w) || !Number.isFinite(src_h)) {
+      return res.status(400).json({ error: "Could not read video dimensions." });
+    }
+
+    // Get video duration to calculate good sample points
+    const { stdout: durationOutput } = await run("ffprobe", [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "json",
+      inputPath,
+    ]);
+    const durationData = JSON.parse(durationOutput);
+    const duration = Number(durationData?.format?.duration) || 10;
+
+    // Sample 3 frames at different points (beginning, middle, end)
+    const numFrames = req.body.num_frames ? Number(req.body.num_frames) : 3;
+    const timestamps = [];
+    for (let i = 0; i < numFrames; i++) {
+      timestamps.push(Math.min(duration * 0.9, (duration / (numFrames + 1)) * (i + 1)));
+    }
+
+    console.log(`Extracting ${numFrames} frames at timestamps:`, timestamps);
+
+    // Extract frames
+    const frames = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      const framePath = path.join("/tmp", `frame-${Date.now()}-${i}.png`);
+      
+      try {
+        await run("ffmpeg", [
+          "-y",
+          "-ss",
+          String(timestamps[i]),
+          "-i",
+          inputPath,
+          "-vframes",
+          "1",
+          "-vf",
+          "scale=iw:ih",
+          framePath,
+        ]);
+
+        const frameBuffer = fs.readFileSync(framePath);
+        frames.push({
+          base64: frameBuffer.toString("base64"),
+          timestamp: timestamps[i],
+        });
+
+        fs.unlinkSync(framePath);
+      } catch (frameErr) {
+        console.error(`Failed to extract frame at ${timestamps[i]}s:`, frameErr);
+      }
+    }
+
+    if (frames.length === 0) {
+      return res.status(500).json({ error: "Failed to extract any frames from video" });
+    }
+
+    console.log(`Successfully extracted ${frames.length} frames, sending to OpenAI...`);
+
+    // Build OpenAI message with all frames
+    const messageContent = [
+      ...frames.map((frame) => ({
+        type: "image_url",
+        image_url: {
+          url: `data:image/png;base64,${frame.base64}`,
+          detail: "high",
+        },
+      })),
+      {
+        type: "text",
+        text: `You are analyzing ${frames.length} frames from a vertical social media video (${src_w}x${src_h} pixels) extracted at timestamps: ${timestamps.map(t => t.toFixed(1) + "s").join(", ")}.
+
+Your task is to determine the optimal crop rectangle that:
+1. EXCLUDES all UI elements: text overlays, usernames, captions, watermarks, logos, headers, footers
+2. PRESERVES the main subject/action/content that viewers care about
+3. WORKS consistently across all ${frames.length} frames shown
+4. Handles any moving or static overlays intelligently
+
+Analysis guidelines:
+- Look for consistent dark bars, text areas, or branding at top/bottom
+- Identify the core content area (usually the person, scene, or main action)
+- Be conservative - it's better to include slightly more than to cut off important content
+- If in doubt, favor keeping the subject's full body/face visible
+
+Respond with ONLY a valid JSON object (no markdown, no code blocks, no extra text):
+{
+  "crop_x": <number>,
+  "crop_y": <number>,
+  "crop_w": <number>,
+  "crop_h": <number>,
+  "reasoning": "<brief explanation of what you excluded and why>",
+  "confidence": <0-100, your confidence in this crop>
+}
+
+All values must be integers. The crop must fit within ${src_w}x${src_h}.`,
+      },
+    ];
+
+    // Call OpenAI GPT-4 Vision
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content: messageContent,
+        },
+      ],
+      max_tokens: 800,
+      temperature: 0.3,
+    });
+
+    console.log("OpenAI response received");
+
+    const responseText = response.choices[0].message.content;
+    console.log("Raw OpenAI response:", responseText);
+
+    // Parse JSON from response (strip any markdown if present)
+    let cropData;
+    try {
+      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        throw new Error("No JSON found in response");
+      }
+      cropData = JSON.parse(jsonMatch[0]);
+    } catch (parseErr) {
+      console.error("Failed to parse OpenAI response:", parseErr);
+      return res.status(500).json({
+        error: "Failed to parse AI response",
+        raw_response: responseText,
+      });
+    }
+
+    // Validate crop values
+    const crop_x = Math.max(0, Math.min(src_w - 10, Math.floor(cropData.crop_x)));
+    const crop_y = Math.max(0, Math.min(src_h - 10, Math.floor(cropData.crop_y)));
+    const crop_w = Math.max(10, Math.min(src_w - crop_x, Math.floor(cropData.crop_w)));
+    const crop_h = Math.max(10, Math.min(src_h - crop_y, Math.floor(cropData.crop_h)));
+
+    // Cleanup
+    fs.unlink(inputPath, () => {});
+
+    return res.json({
+      crop_w,
+      crop_h,
+      x: crop_x,
+      y: crop_y,
+      src_w,
+      src_h,
+      reasoning: cropData.reasoning || "No reasoning provided",
+      confidence: cropData.confidence || 0,
+      frames_analyzed: frames.length,
+      timestamps_sampled: timestamps,
+      ai_powered: true,
+      model_used: "gpt-4o",
+    });
+  } catch (e) {
+    console.error("AI detection error:", e);
+    return res.status(500).json({
+      error: "AI detection failed",
+      details: String(e.message || e),
+      stack: e.stack,
+    });
+  }
+});
+
+// ---------------------------
+// ✅ FALLBACK: Basic pixel detection (no AI)
 // ---------------------------
 app.post("/detect", upload.single("file"), async (req, res) => {
   try {
@@ -102,7 +284,6 @@ app.post("/detect", upload.single("file"), async (req, res) => {
 
     const framePath = path.join("/tmp", `frame-${Date.now()}.png`);
 
-    // Extract one frame
     await run("ffmpeg", [
       "-y",
       "-ss",
@@ -125,22 +306,14 @@ app.post("/detect", upload.single("file"), async (req, res) => {
       maxBandRatio: req.body.max_band_ratio ? Number(req.body.max_band_ratio) : 0.35,
     });
 
-    // Usable area after removing header/footer
-    const usableY0 = topCut;
-    const usableY1 = src_h - bottomCut;
-    const usableH = Math.max(1, usableY1 - usableY0);
+    const safeMargin = req.body.safe_margin ? Number(req.body.safe_margin) : 10;
+    
+    // Keep full width, only trim top/bottom
+    const crop_w = src_w;
+    const crop_h = Math.max(10, src_h - topCut - bottomCut - safeMargin * 2);
+    const x = 0;
+    const y = Math.max(0, topCut + safeMargin);
 
-    // Build a square crop inside usable region
-    const safeMargin = req.body.safe_margin ? Number(req.body.safe_margin) : 0; // pixels
-    const cropSize = Math.min(src_w, usableH) - safeMargin * 2;
-    const crop_w = Math.max(2, Math.floor(cropSize));
-    const crop_h = crop_w;
-
-    // Center it
-    const x = Math.max(0, Math.floor((src_w - crop_w) / 2));
-    const y = Math.max(0, Math.floor(usableY0 + (usableH - crop_h) / 2));
-
-    // cleanup
     fs.unlink(framePath, () => {});
     fs.unlink(inputPath, () => {});
 
@@ -155,6 +328,7 @@ app.post("/detect", upload.single("file"), async (req, res) => {
       bottom_cut: bottomCut,
       sample_time: sampleTime,
       safe_margin: safeMargin,
+      ai_powered: false,
     });
   } catch (e) {
     return res.status(500).json({ error: "detect failed", details: String(e?.stderr || e) });
@@ -162,7 +336,7 @@ app.post("/detect", upload.single("file"), async (req, res) => {
 });
 
 // ---------------------------
-// ✅ EXISTING: /crop
+// ✅ EXISTING: /crop endpoint
 // ---------------------------
 app.post("/crop", upload.single("file"), async (req, res) => {
   try {
@@ -232,5 +406,19 @@ app.post("/crop", upload.single("file"), async (req, res) => {
   }
 });
 
+// ---------------------------
+// Health check
+// ---------------------------
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    openai_configured: !!process.env.OPENAI_API_KEY,
+    endpoints: ["/detect-ai", "/detect", "/crop"],
+  });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`FFmpeg service listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`FFmpeg service with AI detection listening on port ${PORT}`);
+  console.log(`OpenAI API Key configured: ${!!process.env.OPENAI_API_KEY}`);
+});
